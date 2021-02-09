@@ -23,39 +23,25 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.layout.FirstBaseline
-import androidx.compose.ui.layout.Measurable
-import androidx.compose.ui.layout.MeasureScope
-import androidx.compose.ui.layout.MultiMeasureLayout
-import androidx.compose.ui.layout.ParentDataModifier
-import androidx.compose.ui.layout.Placeable
-import androidx.compose.ui.layout.layoutId
+import androidx.compose.ui.layout.*
 import androidx.compose.ui.platform.InspectorValueInfo
 import androidx.compose.ui.platform.debugInspectorInfo
-import androidx.compose.ui.unit.Constraints
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.LayoutDirection
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.hasFixedHeight
-import androidx.compose.ui.unit.hasFixedWidth
+import androidx.compose.ui.unit.*
 import androidx.compose.ui.util.fastForEach
 import androidx.constraintlayout.core.state.ConstraintReference
 import androidx.constraintlayout.core.state.Dimension.SPREAD_DIMENSION
 import androidx.constraintlayout.core.state.Dimension.WRAP_DIMENSION
-import androidx.constraintlayout.core.widgets.ConstraintWidget
+import androidx.constraintlayout.core.widgets.*
 import androidx.constraintlayout.core.widgets.ConstraintWidget.DimensionBehaviour.FIXED
 import androidx.constraintlayout.core.widgets.ConstraintWidget.DimensionBehaviour.MATCH_CONSTRAINT
 import androidx.constraintlayout.core.widgets.ConstraintWidget.DimensionBehaviour.WRAP_CONTENT
 import androidx.constraintlayout.core.widgets.ConstraintWidget.MATCH_CONSTRAINT_SPREAD
 import androidx.constraintlayout.core.widgets.ConstraintWidget.MATCH_CONSTRAINT_WRAP
-import androidx.constraintlayout.core.widgets.ConstraintWidgetContainer
-import androidx.constraintlayout.core.widgets.Optimizer
 import androidx.constraintlayout.core.widgets.analyzer.BasicMeasure
 import androidx.constraintlayout.core.widgets.analyzer.BasicMeasure.Measure.TRY_GIVEN_DIMENSIONS
 import androidx.constraintlayout.core.widgets.analyzer.BasicMeasure.Measure.USE_GIVEN_DIMENSIONS
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
 
 /**
  * Layout that positions its children according to the constraints between them.
@@ -611,7 +597,9 @@ class ChainStyle internal constructor(
 private class ConstraintLayoutParentData(
         val ref: ConstrainedLayoutReference,
         val constrain: ConstrainScope.() -> Unit
-)
+): LayoutIdParentData {
+    override val layoutId: Any = ref.id
+}
 
 /**
  * Scope used by `Modifier.constrainAs`.
@@ -1128,9 +1116,13 @@ class State(val density: Density) : SolverState() {
         mReferences[PARENT] = mParent
         super.reset()
     }
+
+    fun getHelperKeyId(helperWidget: HelperWidget): Any? {
+        return mHelperReferences.filterValues { it.helperWidget == helperWidget }.keys.firstOrNull()
+    }
 }
 
-private class Measurer : BasicMeasure.Measurer {
+class Measurer : BasicMeasure.Measurer {
     private val root = ConstraintWidgetContainer(0, 0).also { it.measurer = this }
     private val placeables = mutableMapOf<Measurable, Placeable>()
     private val lastMeasures = mutableMapOf<Measurable, Array<Int>>()
@@ -1149,6 +1141,107 @@ private class Measurer : BasicMeasure.Measurer {
         positionsCache.clear()
         state.reset()
     }
+
+    private fun ConstraintWidget.getHelperId() = state.getHelperKeyId(this as HelperWidget)
+            ?: "UnknownHelper"
+
+    private fun ConstraintWidget?.getRefId() = (this?.companionWidget as? Measurable)?.layoutId
+            ?: "UnknownTarget"
+
+    fun getConstraintsInfo(startX: Int, startY: Int): String {
+        val idToConstraintsMap = mutableMapOf<String, ViewWithBoundsAndConstraints>()
+        val rootId = Any().toString()
+        root.children.forEach { constraintWidget ->
+            val isParent = root == constraintWidget
+            val isHelper = constraintWidget is HelperWidget
+
+            val widgetId = when {
+                isParent -> rootId
+                isHelper -> constraintWidget.getHelperId()
+                else -> constraintWidget.getRefId()
+            }
+
+            val widgetBounds = IntBounds(
+                    constraintWidget.left + startX,
+                    constraintWidget.top + startY,
+                    constraintWidget.right + startX,
+                    constraintWidget.bottom + startY
+            )
+
+            val mutableConstraints = mutableListOf<ConstraintDescription>()
+            val helperReferences = mutableListOf<String>()
+            if (constraintWidget is HelperWidget) {
+                for (containedWidget in constraintWidget.mWidgets) {
+                    val targetIsParent = root == containedWidget
+                    val targetId = if (targetIsParent) rootId else constraintWidget.getRefId()
+                    helperReferences.add(targetId.toString())
+                }
+            }
+            constraintWidget.anchors.forEach { anchor ->
+                if (anchor.isConnected) {
+                    val targetWidget = anchor.target.owner
+                    val targetIsParent = root == targetWidget
+                    val targetIsHelper = targetWidget is HelperWidget
+                    val targetId = when {
+                        targetIsParent -> rootId
+                        targetIsHelper -> targetWidget.getHelperId()
+                        else -> targetWidget.getRefId()
+                    }
+                    mutableConstraints.add(
+                            ConstraintDescription(
+                                    originAnchor = anchor.type,
+                                    targetAnchor = anchor.target!!.type,
+                                    target = targetId.toString(),
+                                    margin = anchor.margin
+                            )
+                    )
+                }
+            }
+
+            idToConstraintsMap[widgetId.toString()] = ViewWithBoundsAndConstraints(
+                    viewId = widgetId.toString(),
+                    box = widgetBounds,
+                    isHelper = isHelper,
+                    isRoot = false,
+                    helperReferences = helperReferences,
+                    constraints = mutableConstraints
+            )
+        }
+        idToConstraintsMap[rootId] = ViewWithBoundsAndConstraints(
+                viewId = rootId,
+                box = IntBounds(
+                        root.left + startX,
+                        root.top + startY,
+                        root.right + startX,
+                        root.bottom + startY
+                ),
+                isHelper = false,
+                isRoot = true,
+                helperReferences = emptyList(),
+                constraints = emptyList()
+        )
+        return Gson().toJson(ConstraintsMap(idToConstraintsMap))
+    }
+
+    data class ConstraintsMap(
+            val idToConstraintsMap: Map<String, ViewWithBoundsAndConstraints>
+    )
+
+    data class ViewWithBoundsAndConstraints(
+            val viewId: String,
+            val box: IntBounds,
+            val isHelper: Boolean,
+            val isRoot: Boolean,
+            val helperReferences: List<String>,
+            val constraints: List<ConstraintDescription>
+    )
+
+    data class ConstraintDescription(
+            val originAnchor: ConstraintAnchor.Type,
+            val targetAnchor: ConstraintAnchor.Type,
+            val target: String,
+            val margin: Int,
+    )
 
     override fun measure(constraintWidget: ConstraintWidget, measure: BasicMeasure.Measure) {
         val measurable = constraintWidget.companionWidget
